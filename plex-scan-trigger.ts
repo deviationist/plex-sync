@@ -5,6 +5,7 @@ import {
   fetchActivitySnapshot,
   log as baseLog,
   logError as baseLogError,
+  makeDebug,
 } from "./plex-client.ts";
 import type { Section } from "@ctrl/plex";
 
@@ -24,7 +25,8 @@ USAGE:
 OPTIONS:
     -h, --help       Show this help message and exit
     --wait-finish    Wait for all library scans to complete before exiting
-    -v, --verbose    Enable verbose debug output
+    -v, --verbose    Verbose debug output (-v once for milestones,
+                     -vv or -v -v for step-by-step trace)
 
 ARGUMENTS:
     SECTION_IDS      Optional comma-separated list of section IDs to trigger.
@@ -47,8 +49,8 @@ export interface TriggerScanOptions {
   sectionIds?: string[];
   /** Poll /activities until each started scan completes. */
   waitFinish?: boolean;
-  /** Print debug logs. */
-  verbose?: boolean;
+  /** Verbosity: 0 silent, 1 milestone debug, 2 step-by-step trace. */
+  verbose?: number;
 }
 
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
@@ -57,7 +59,7 @@ const MAX_POLLS_BEFORE_INSTANT_FINISH = 5;
 interface ParsedArgs {
   help: boolean;
   waitFinish: boolean;
-  verbose: boolean;
+  verbose: number;
   sectionIds: string[];
   errors: string[];
 }
@@ -66,7 +68,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   const out: ParsedArgs = {
     help: false,
     waitFinish: false,
-    verbose: false,
+    verbose: 0,
     sectionIds: [],
     errors: [],
   };
@@ -74,10 +76,12 @@ function parseArgs(argv: string[]): ParsedArgs {
   for (const arg of argv) {
     if (arg === "-h" || arg === "--help") out.help = true;
     else if (arg === "--wait-finish") out.waitFinish = true;
-    else if (arg === "-v" || arg === "--verbose") out.verbose = true;
+    else if (arg === "-v" || arg === "--verbose") out.verbose += 1;
+    else if (arg === "-vv") out.verbose += 2;
     else if (arg.startsWith("-")) out.errors.push(`Unknown option: ${arg}`);
     else positional.push(arg);
   }
+  if (out.verbose > 2) out.verbose = 2;
   if (positional.length > 1) {
     out.errors.push(
       `Expected at most one positional arg (comma-separated IDs); got ${positional.length}: ${positional.join(" ")}`,
@@ -113,15 +117,9 @@ interface SectionTracker {
   pollsWithoutObservation: number;
 }
 
-function makeDebug(verbose: boolean) {
-  return (msg: string) => {
-    if (verbose) console.log(`[DEBUG] ${msg}`);
-  };
-}
-
 export async function triggerScan(options: TriggerScanOptions = {}): Promise<void> {
-  const { sectionIds: requestedIds = [], waitFinish = false, verbose = false } = options;
-  const debug = makeDebug(verbose);
+  const { sectionIds: requestedIds = [], waitFinish = false, verbose = 0 } = options;
+  const { debug, trace } = makeDebug(verbose, TAG);
 
   const server = getPlexServer();
   log(`Using Plex host: ${server.baseurl}`);
@@ -132,6 +130,7 @@ export async function triggerScan(options: TriggerScanOptions = {}): Promise<voi
   const byId = new Map<string, Section>();
   for (const section of allSections) {
     byId.set(String(section.key), section);
+    trace(`indexed section ${section.key} (${section.title}) — locations: ${section.locations.map((l) => l.path).join(", ")}`);
   }
 
   let targets: Section[];
@@ -147,6 +146,7 @@ export async function triggerScan(options: TriggerScanOptions = {}): Promise<voi
         logError(`Section ID ${id} not found in this Plex library — skipping`);
         continue;
       }
+      trace(`resolved section ID ${id} -> "${section.title}"`);
       targets.push(section);
     }
   }
@@ -179,8 +179,8 @@ export async function triggerScan(options: TriggerScanOptions = {}): Promise<voi
   log("Scan trigger completed.");
 }
 
-async function waitForCompletion(startedIds: string[], verbose: boolean): Promise<void> {
-  const debug = makeDebug(verbose);
+async function waitForCompletion(startedIds: string[], verbose: number): Promise<void> {
+  const { debug, trace } = makeDebug(verbose, TAG);
   const trackers = new Map<string, SectionTracker>();
   for (const id of startedIds) {
     trackers.set(id, {
@@ -232,21 +232,30 @@ async function waitForCompletion(startedIds: string[], verbose: boolean): Promis
     const activeIds = new Set(snapshot.map((a) => a.sectionId));
     for (const entry of snapshot) {
       const tracker = trackers.get(entry.sectionId);
-      if (!tracker) continue;
+      if (!tracker) {
+        trace(`activity for untracked section ${entry.sectionId} — ignoring`);
+        continue;
+      }
+      const wasState = tracker.state;
       tracker.state = "scanning";
       tracker.progress = entry.progress;
       tracker.subtitle = entry.subtitle;
       tracker.observedScanning = true;
       tracker.pollsWithoutObservation = 0;
+      if (wasState !== "scanning") {
+        trace(`section ${entry.sectionId}: ${wasState} -> scanning (${entry.progress}% ${entry.subtitle})`);
+      }
     }
 
     for (const [id, tracker] of trackers) {
       if (tracker.state === "completed") continue;
       if (activeIds.has(id)) continue;
       if (tracker.observedScanning) {
+        trace(`section ${id}: scanning -> completed (no longer in activities)`);
         tracker.state = "completed";
       } else {
         tracker.pollsWithoutObservation += 1;
+        trace(`section ${id}: still pending (${tracker.pollsWithoutObservation}/${MAX_POLLS_BEFORE_INSTANT_FINISH} polls)`);
         if (tracker.pollsWithoutObservation >= MAX_POLLS_BEFORE_INSTANT_FINISH) {
           debug(`Section ${id} never observed scanning after ${MAX_POLLS_BEFORE_INSTANT_FINISH} polls — treating as instant finish`);
           tracker.state = "completed";

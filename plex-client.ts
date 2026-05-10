@@ -16,6 +16,22 @@ export function logError(tag: string, message: string): void {
   console.error(`${new Date().toISOString()} [${tag}] ERROR: ${message}`);
 }
 
+export type Verbosity = 0 | 1 | 2;
+
+export function makeDebug(level: number, tag: string) {
+  const lvl = Math.max(0, Math.min(2, level)) as Verbosity;
+  return {
+    /** Level 1 — high-level milestones beyond the default `log` lines. */
+    debug: (message: string) => {
+      if (lvl >= 1) console.log(`[DEBUG ${tag}] ${message}`);
+    },
+    /** Level 2 — step-by-step internals (path tests, section matching, polls). */
+    trace: (message: string) => {
+      if (lvl >= 2) console.log(`[TRACE ${tag}] ${message}`);
+    },
+  };
+}
+
 interface PlexConfig {
   host: string;
   token: string;

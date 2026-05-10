@@ -7,11 +7,23 @@ import {
   getPlexServer,
   log as baseLog,
   logError as baseLogError,
+  makeDebug,
 } from "./plex-client.ts";
 
 const TAG = "plex-orchestrator";
 const log = (msg: string) => baseLog(TAG, msg);
 const logError = (msg: string) => baseLogError(TAG, msg);
+
+function parseVerbosity(argv: string[]): { verbose: number; unknown: string[] } {
+  let verbose = 0;
+  const unknown: string[] = [];
+  for (const arg of argv) {
+    if (arg === "-v" || arg === "--verbose") verbose += 1;
+    else if (arg === "-vv") verbose += 2;
+    else unknown.push(arg);
+  }
+  return { verbose: Math.min(2, verbose), unknown };
+}
 
 type PathMap = Record<string, string>;
 
@@ -26,6 +38,13 @@ function pathStartsWith(p: string, prefix: string): boolean {
 }
 
 async function main(): Promise<void> {
+  const { verbose, unknown } = parseVerbosity(process.argv.slice(2));
+  if (unknown.length > 0) {
+    logError(`Unknown argument(s): ${unknown.join(", ")} — only -v/-vv are accepted`);
+    process.exit(2);
+  }
+  const { debug, trace } = makeDebug(verbose, TAG);
+
   if (!CHANGED_PATHS) {
     log("No CHANGED_PATHS set, nothing to do");
     return;
@@ -41,6 +60,9 @@ async function main(): Promise<void> {
   }
 
   const entries = Object.entries(pathMap);
+  debug(`Loaded ${entries.length} mapping(s) from ${PATH_MAP_FILE}`);
+  for (const [host, container] of entries) trace(`  map: ${host} -> ${container}`);
+
   const changedPaths = CHANGED_PATHS.split("\n").map((p) => p.trim()).filter(Boolean);
   log(`Processing ${changedPaths.length} changed path(s)`);
 
@@ -48,8 +70,11 @@ async function main(): Promise<void> {
   for (const hostPath of changedPaths) {
     let mapped: string | null = null;
     for (const [host, container] of entries) {
-      if (pathStartsWith(hostPath, host)) {
+      const matches = pathStartsWith(hostPath, host);
+      trace(`  test "${hostPath}" startsWith "${host}" = ${matches}`);
+      if (matches) {
         mapped = container + hostPath.slice(host.length);
+        trace(`  mapped via "${host}" -> "${container}" -> ${mapped}`);
         break;
       }
     }
@@ -71,12 +96,15 @@ async function main(): Promise<void> {
   const server = getPlexServer();
   const library = await server.library();
   const sections = await library.sections();
+  debug(`Plex returned ${sections.length} section(s)`);
 
   const sectionIds = new Set<string>();
   for (const parent of mappedParentDirs) {
     for (const section of sections) {
       for (const location of section.locations) {
-        if (pathStartsWith(parent, location.path)) {
+        const matches = pathStartsWith(parent, location.path);
+        trace(`  test parent "${parent}" against section ${section.key} (${section.title}) location "${location.path}" = ${matches}`);
+        if (matches) {
           sectionIds.add(String(section.key));
           log(`  matched section ${section.key} (${section.title}) via location ${location.path}`);
         }
@@ -91,7 +119,7 @@ async function main(): Promise<void> {
 
   const ids = [...sectionIds].sort((a, b) => Number(a) - Number(b));
   log(`Triggering scan for sections: ${ids.join(",")}`);
-  await triggerScan({ sectionIds: ids });
+  await triggerScan({ sectionIds: ids, verbose });
   log(`Done — triggered ${sectionIds.size} section(s)`);
 }
 
