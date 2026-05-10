@@ -1,7 +1,7 @@
 import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { triggerScan } from "./plex-scan-trigger.ts";
+import { triggerScan, type TriggerTarget } from "./plex-scan-trigger.ts";
 import {
   SCRIPT_DIRECTORY,
   getPlexServer,
@@ -98,29 +98,38 @@ async function main(): Promise<void> {
   const sections = await library.sections();
   debug(`Plex returned ${sections.length} section(s)`);
 
-  const sectionIds = new Set<string>();
+  // Build a deduped list of (sectionId, parent) targets so each parent dir
+  // gets its own scoped scan rather than refreshing the whole section.
+  const seen = new Set<string>();
+  const targets: TriggerTarget[] = [];
   for (const parent of mappedParentDirs) {
+    let matchedAny = false;
     for (const section of sections) {
       for (const location of section.locations) {
         const matches = pathStartsWith(parent, location.path);
         trace(`  test parent "${parent}" against section ${section.key} (${section.title}) location "${location.path}" = ${matches}`);
-        if (matches) {
-          sectionIds.add(String(section.key));
-          log(`  matched section ${section.key} (${section.title}) via location ${location.path}`);
-        }
+        if (!matches) continue;
+        matchedAny = true;
+        const key = `${section.key}\0${parent}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        targets.push({ sectionId: String(section.key), path: parent });
+        log(`  matched section ${section.key} (${section.title}) via location ${location.path} — will scope scan to ${parent}`);
       }
+    }
+    if (!matchedAny) {
+      trace(`  parent "${parent}" did not match any section location`);
     }
   }
 
-  if (sectionIds.size === 0) {
+  if (targets.length === 0) {
     log("No matching Plex sections found for changed paths");
     return;
   }
 
-  const ids = [...sectionIds].sort((a, b) => Number(a) - Number(b));
-  log(`Triggering scan for sections: ${ids.join(",")}`);
-  await triggerScan({ sectionIds: ids, verbose });
-  log(`Done — triggered ${sectionIds.size} section(s)`);
+  log(`Triggering ${targets.length} scoped scan(s)`);
+  await triggerScan({ targets, verbose });
+  log(`Done — triggered ${targets.length} scoped scan(s)`);
 }
 
 main().catch((err) => {

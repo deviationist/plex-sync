@@ -27,26 +27,38 @@ OPTIONS:
     --wait-finish    Wait for all library scans to complete before exiting
     -v, --verbose    Verbose debug output (-v once for milestones,
                      -vv or -v -v for step-by-step trace)
+    --path PATH      Scope the scan to PATH (a Plex container-side path under
+                     the section's root). Requires exactly one SECTION_ID.
 
 ARGUMENTS:
     SECTION_IDS      Optional comma-separated list of section IDs to trigger.
                      If not provided, all sections will be triggered.
 
 EXAMPLES:
-    plex-scan-trigger.ts                          # Trigger all library sections
-    plex-scan-trigger.ts 1,3,5                    # Trigger sections 1, 3, and 5
-    plex-scan-trigger.ts --wait-finish            # Trigger all and wait
-    plex-scan-trigger.ts --wait-finish 1,3,5      # Trigger specific and wait
-    plex-scan-trigger.ts -v --wait-finish 1,3,5   # Verbose + wait
+    plex-scan-trigger.ts                                              # All sections
+    plex-scan-trigger.ts 1,3,5                                        # Sections 1, 3, 5
+    plex-scan-trigger.ts --wait-finish 1,3,5                          # And wait
+    plex-scan-trigger.ts -v --wait-finish 1,3,5                       # Verbose + wait
+    plex-scan-trigger.ts 25 --path /data/music/main/Synthwave         # Partial scan
+    plex-scan-trigger.ts 25 --path /data/music/main/House --wait-finish
 
 REQUIREMENTS:
     .env in the script directory with PLEX_HOST and PLEX_TOKEN.
     Optional POLL_INTERVAL (seconds, default 2) for --wait-finish polling.
 `;
 
+export interface TriggerTarget {
+  sectionId: string;
+  /** Optional Plex container-side path to scope the scan. */
+  path?: string;
+}
+
 export interface TriggerScanOptions {
-  /** Section IDs to trigger. If omitted/empty, trigger all sections. */
-  sectionIds?: string[];
+  /**
+   * Each target is one Plex `/library/sections/{id}/refresh` call.
+   * Omit or pass [] to trigger every section (full).
+   */
+  targets?: TriggerTarget[];
   /** Poll /activities until each started scan completes. */
   waitFinish?: boolean;
   /** Verbosity: 0 silent, 1 milestone debug, 2 step-by-step trace. */
@@ -61,6 +73,7 @@ interface ParsedArgs {
   waitFinish: boolean;
   verbose: number;
   sectionIds: string[];
+  path: string | null;
   errors: string[];
 }
 
@@ -70,15 +83,27 @@ function parseArgs(argv: string[]): ParsedArgs {
     waitFinish: false,
     verbose: 0,
     sectionIds: [],
+    path: null,
     errors: [],
   };
   const positional: string[] = [];
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
     if (arg === "-h" || arg === "--help") out.help = true;
     else if (arg === "--wait-finish") out.waitFinish = true;
     else if (arg === "-v" || arg === "--verbose") out.verbose += 1;
     else if (arg === "-vv") out.verbose += 2;
-    else if (arg.startsWith("-")) out.errors.push(`Unknown option: ${arg}`);
+    else if (arg === "--path") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("-")) {
+        out.errors.push("--path requires a path value");
+      } else {
+        out.path = value;
+        i++;
+      }
+    } else if (arg.startsWith("--path=")) {
+      out.path = arg.slice("--path=".length);
+    } else if (arg.startsWith("-")) out.errors.push(`Unknown option: ${arg}`);
     else positional.push(arg);
   }
   if (out.verbose > 2) out.verbose = 2;
@@ -95,6 +120,15 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
     }
     out.sectionIds = ids;
+  }
+  if (out.path !== null) {
+    if (out.sectionIds.length === 0) {
+      out.errors.push("--path requires exactly one SECTION_ID (none given)");
+    } else if (out.sectionIds.length > 1) {
+      out.errors.push(
+        `--path requires exactly one SECTION_ID (got ${out.sectionIds.length}: ${out.sectionIds.join(",")})`,
+      );
+    }
   }
   return out;
 }
@@ -118,7 +152,7 @@ interface SectionTracker {
 }
 
 export async function triggerScan(options: TriggerScanOptions = {}): Promise<void> {
-  const { sectionIds: requestedIds = [], waitFinish = false, verbose = 0 } = options;
+  const { targets: requestedTargets, waitFinish = false, verbose = 0 } = options;
   const { debug, trace } = makeDebug(verbose, TAG);
 
   const server = getPlexServer();
@@ -133,49 +167,63 @@ export async function triggerScan(options: TriggerScanOptions = {}): Promise<voi
     trace(`indexed section ${section.key} (${section.title}) — locations: ${section.locations.map((l) => l.path).join(", ")}`);
   }
 
-  let targets: Section[];
-  if (requestedIds.length === 0) {
-    log(`No section IDs provided, triggering all ${allSections.length} sections`);
-    targets = [...allSections];
+  interface ResolvedTarget {
+    section: Section;
+    path?: string;
+  }
+
+  let resolved: ResolvedTarget[];
+  if (!requestedTargets || requestedTargets.length === 0) {
+    log(`No targets provided, triggering all ${allSections.length} sections (full)`);
+    resolved = allSections.map((s) => ({ section: s }));
   } else {
-    log(`Using provided section IDs: ${requestedIds.join(",")}`);
-    targets = [];
-    for (const id of requestedIds) {
-      const section = byId.get(String(id));
+    log(`Using ${requestedTargets.length} requested target(s)`);
+    resolved = [];
+    for (const t of requestedTargets) {
+      const section = byId.get(String(t.sectionId));
       if (!section) {
-        logError(`Section ID ${id} not found in this Plex library — skipping`);
+        logError(`Section ID ${t.sectionId} not found in this Plex library — skipping`);
         continue;
       }
-      trace(`resolved section ID ${id} -> "${section.title}"`);
-      targets.push(section);
+      trace(`resolved section ID ${t.sectionId} -> "${section.title}"${t.path ? ` (path: ${t.path})` : ""}`);
+      resolved.push({ section, path: t.path });
     }
   }
 
-  targets.sort((a, b) => Number(a.key) - Number(b.key));
+  resolved.sort((a, b) => {
+    const cmp = Number(a.section.key) - Number(b.section.key);
+    if (cmp !== 0) return cmp;
+    return (a.path ?? "").localeCompare(b.path ?? "");
+  });
 
-  const startedIds: string[] = [];
-  for (const section of targets) {
-    log(`Triggering scan of section ${section.key} (${section.title})...`);
-    debug(`Calling section.update() — GET /library/sections/${section.key}/refresh`);
+  const startedIds = new Set<string>();
+  for (const { section, path } of resolved) {
+    const scope = path ? ` path="${path}"` : "";
+    log(`Triggering scan of section ${section.key} (${section.title})${scope}...`);
+    debug(
+      path
+        ? `Calling section.update({ path }) — GET /library/sections/${section.key}/refresh?path=${encodeURIComponent(path)}`
+        : `Calling section.update() — GET /library/sections/${section.key}/refresh`,
+    );
     try {
-      await section.update();
-      console.log(`  ✓ Section ${section.key} scan triggered successfully`);
-      startedIds.push(String(section.key));
+      await (path ? section.update({ path }) : section.update());
+      console.log(`  ✓ Section ${section.key}${scope} scan triggered successfully`);
+      startedIds.add(String(section.key));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.log(`  ✗ Failed to trigger section ${section.key}: ${msg}`);
+      console.log(`  ✗ Failed to trigger section ${section.key}${scope}: ${msg}`);
     }
   }
 
-  if (!waitFinish || startedIds.length === 0) {
-    if (waitFinish && startedIds.length === 0) {
+  if (!waitFinish || startedIds.size === 0) {
+    if (waitFinish && startedIds.size === 0) {
       log("No sections started — nothing to wait on");
     }
     log("Scan trigger completed.");
     return;
   }
 
-  await waitForCompletion(startedIds, verbose);
+  await waitForCompletion([...startedIds], verbose);
   log("Scan trigger completed.");
 }
 
@@ -295,8 +343,13 @@ async function main(): Promise<void> {
     console.error("Run with --help for usage.");
     process.exit(2);
   }
+  const targets: TriggerTarget[] = args.sectionIds.map((id) => {
+    const t: TriggerTarget = { sectionId: id };
+    if (args.path !== null) t.path = args.path;
+    return t;
+  });
   await triggerScan({
-    sectionIds: args.sectionIds,
+    targets: targets.length > 0 ? targets : undefined,
     waitFinish: args.waitFinish,
     verbose: args.verbose,
   });
