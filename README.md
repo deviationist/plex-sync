@@ -12,7 +12,7 @@ plex-orchestrator.ts      ← takes a list of changed host paths,
         │
         ▼
 plex-scan-trigger.ts      ← dumb trigger: hits Plex with the given section IDs
-        │  (or plex-scan.sh, the legacy bash equivalent)
+        │
         ▼
 Plex Media Server         ← /library/sections/{id}/refresh
 ```
@@ -24,13 +24,11 @@ The orchestrator is meant to be invoked from any change-notification system. It 
 ## Files
 
 - **`plex-orchestrator.ts`** — Orchestrator. Reads `CHANGED_PATHS`, maps each host path to its container path via `plex-path-map.json`, queries Plex's `/library/sections` to find which section owns each parent dir, then calls `triggerScan()` from `plex-scan-trigger.ts` in-process with the deduped section IDs.
-- **`plex-scan-trigger.ts`** — TypeScript trigger (preferred). Uses `@ctrl/plex` to call `/library/sections/{id}/refresh` for each ID. Standalone CLI: `--wait-finish` polls `/activities` until scans complete and `-v` enables debug output. Also exports `triggerScan()` for in-process use by the orchestrator. Run with no args to trigger *every* section.
+- **`plex-scan-trigger.ts`** — Trigger. Uses `@ctrl/plex` to call `/library/sections/{id}/refresh` for each ID, optionally scoped to a `path`. Standalone CLI: `--wait-finish` polls `/activities` until scans complete, `-v`/`-vv` for debug output, `--path` for partial scans. Also exports `triggerScan()` for in-process use by the orchestrator. Run with no args to trigger *every* section.
 - **`plex-client.ts`** — Shared module: loads `.env`, validates `PLEX_HOST`/`PLEX_TOKEN`, returns a cached `PlexServer`, and exposes a typed `/activities` snapshot helper (the `@ctrl/plex` `Activity` type omits `librarySectionID`, so this fills the gap).
-- **`plex-scan.sh`** — Legacy bash trigger. Same job as `plex-scan-trigger.ts` but via curl. Kept for ad-hoc shell use; the orchestrator no longer invokes it.
 - **`plex-path-map.json`** — Host-path → container-path mapping. Required by the orchestrator only; format is a flat JSON object.
 - **`.env` / `.env.example`** — `PLEX_HOST` and `PLEX_TOKEN`. Shared by all entry points.
 - **`package.json`** — Declares `tsx`, `dotenv`, and `@ctrl/plex` so the orchestrator runs without depending on any other project's `node_modules`.
-- **`plex-scan-old.sh`** — Legacy. Superseded by `plex-scan.sh`; kept for reference.
 
 ## Setup
 
@@ -51,21 +49,13 @@ curl -s "$PLEX_HOST/library/sections?X-Plex-Token=$PLEX_TOKEN" \
 
 ## Usage
 
-**Trigger directly with the TypeScript CLI** (preferred):
+**Trigger directly:**
 ```bash
 npx tsx ./plex-scan-trigger.ts 25                                 # trigger section 25
 npx tsx ./plex-scan-trigger.ts 1,3,5                              # trigger multiple
 npx tsx ./plex-scan-trigger.ts --wait-finish 25                   # block until scan completes
 npx tsx ./plex-scan-trigger.ts 25 --path /data/music/main/Synth   # scoped/partial scan
 npx tsx ./plex-scan-trigger.ts                                    # trigger all sections
-```
-
-**Trigger directly with the legacy bash script** (still works):
-```bash
-./plex-scan.sh 25                 # trigger section 25
-./plex-scan.sh 1,3,5              # trigger multiple
-./plex-scan.sh --wait-finish 25   # block until scan completes
-./plex-scan.sh                    # trigger all sections
 ```
 
 **Orchestrator from a change notifier** — set `CHANGED_PATHS` (newline-separated absolute host paths) and invoke:
