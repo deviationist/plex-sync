@@ -53,10 +53,11 @@ curl -s "$PLEX_HOST/library/sections?X-Plex-Token=$PLEX_TOKEN" \
 
 **Trigger directly with the TypeScript CLI** (preferred):
 ```bash
-./node_modules/.bin/tsx ./plex-scan-trigger.ts 25                 # trigger section 25
-./node_modules/.bin/tsx ./plex-scan-trigger.ts 1,3,5              # trigger multiple
-./node_modules/.bin/tsx ./plex-scan-trigger.ts --wait-finish 25   # block until scan completes
-./node_modules/.bin/tsx ./plex-scan-trigger.ts                    # trigger all sections
+npx tsx ./plex-scan-trigger.ts 25                                 # trigger section 25
+npx tsx ./plex-scan-trigger.ts 1,3,5                              # trigger multiple
+npx tsx ./plex-scan-trigger.ts --wait-finish 25                   # block until scan completes
+npx tsx ./plex-scan-trigger.ts 25 --path /data/music/main/Synth   # scoped/partial scan
+npx tsx ./plex-scan-trigger.ts                                    # trigger all sections
 ```
 
 **Trigger directly with the legacy bash script** (still works):
@@ -69,8 +70,7 @@ curl -s "$PLEX_HOST/library/sections?X-Plex-Token=$PLEX_TOKEN" \
 
 **Orchestrator from a change notifier** — set `CHANGED_PATHS` (newline-separated absolute host paths) and invoke:
 ```bash
-CHANGED_PATHS="/mnt/music/main/track.mp3" \
-  ./node_modules/.bin/tsx ./plex-orchestrator.ts
+CHANGED_PATHS="/mnt/music/main/track.mp3" npx tsx ./plex-orchestrator.ts
 ```
 Paths that don't match any entry in `plex-path-map.json` are silently skipped, so it's safe to feed the orchestrator any path stream — it only refreshes when it finds a real mapping.
 
