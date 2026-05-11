@@ -1,4 +1,4 @@
-# plex-scan
+# plex-sync
 
 Tools for refreshing Plex libraries — usable on their own, or wired into any system that emits filesystem-change events.
 
@@ -37,7 +37,7 @@ The orchestrator is meant to be invoked from any change-notification system. It 
 ## Setup
 
 ```bash
-cd /home/xavi/scripts/plex-scan
+cd /home/xavi/scripts/plex-sync
 cp .env.example .env       # then fill in PLEX_HOST and PLEX_TOKEN
 npm install                # for tsx + dotenv
 ```

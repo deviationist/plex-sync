@@ -1,5 +1,5 @@
 {
-  "name": "plex-scan",
+  "name": "plex-sync",
   "private": true,
   "type": "module",
   "dependencies": {
