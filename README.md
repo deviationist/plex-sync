@@ -30,7 +30,7 @@ The orchestrator is meant to be invoked from any change-notification system. It 
 - **`plex-orchestrator.ts`** — Orchestrator. Reads `CHANGED_EVENTS`, maps each event's host path to its container path via `plex-path-map.json`, queries Plex's `/library/sections` to find which section owns each path, API-deletes unlink targets via `deleteItemByPath`, then calls `triggerScan()` from `plex-scan-trigger.ts` with the deduped `(sectionId, parentDir)` set covering every event.
 - **`plex-scan-trigger.ts`** — Trigger. Uses `@ctrl/plex` to call `/library/sections/{id}/refresh` for each ID, optionally scoped to a `path`. Also exports `deleteItemByPath`, which looks up Plex items by exact file path via `/library/sections/{id}/all?type=N&file=<path>` and issues `DELETE /library/metadata/{ratingKey}`. Standalone CLI: `--wait-finish` polls `/activities` until scans complete, `-v`/`-vv` for debug output, `--path` for partial scans. Run with no args to trigger *every* section.
 - **`plex-client.ts`** — Shared module: loads `.env`, validates `PLEX_HOST`/`PLEX_TOKEN`, returns a cached `PlexServer`, and exposes a typed `/activities` snapshot helper (the `@ctrl/plex` `Activity` type omits `librarySectionID`, so this fills the gap).
-- **`plex-path-map.json`** — Host-path → container-path mapping. Required by the orchestrator only; format is a flat JSON object.
+- **`plex-path-map.json`** / **`plex-path-map.example.json`** — Host-path → container-path mapping. Required by the orchestrator only; format is a flat JSON object. The real file is gitignored — copy the example and fill in your own paths.
 - **`.env` / `.env.example`** — `PLEX_HOST` and `PLEX_TOKEN`. Shared by all entry points.
 - **`package.json`** — Declares `tsx`, `dotenv`, and `@ctrl/plex` so the orchestrator runs without depending on any other project's `node_modules`.
 
@@ -38,8 +38,9 @@ The orchestrator is meant to be invoked from any change-notification system. It 
 
 ```bash
 cd /home/xavi/scripts/plex-sync
-cp .env.example .env       # then fill in PLEX_HOST and PLEX_TOKEN
-npm install                # for tsx + dotenv
+cp .env.example .env                                   # then fill in PLEX_HOST and PLEX_TOKEN
+cp plex-path-map.example.json plex-path-map.json       # then edit for your host/container paths
+npm install                                            # for tsx + dotenv
 ```
 
 Edit `plex-path-map.json` to match your host mounts and Plex container paths. To discover container paths:
@@ -80,8 +81,8 @@ The orchestrator routes events by type:
 
 ```json
 {
-  "/mnt/music/main": "/data/music/main",
-  "/mnt/music/on-hold": "/data/music/on-hold"
+  "/host/path/to/media": "/container/path/to/media",
+  "/host/path/to/another": "/container/path/to/another"
 }
 ```
 

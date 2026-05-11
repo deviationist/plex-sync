@@ -1,0 +1,4 @@
+{
+  "/host/path/to/media": "/container/path/to/media",
+  "/host/path/to/another": "/container/path/to/another"
+}
