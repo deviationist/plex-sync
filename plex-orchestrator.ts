@@ -1,7 +1,8 @@
 import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { triggerScan, type TriggerTarget } from "./plex-scan-trigger.ts";
+import type { Section } from "@ctrl/plex";
+import { deleteItemByPath, triggerScan, type TriggerTarget } from "./plex-scan-trigger.ts";
 import {
   SCRIPT_DIRECTORY,
   getPlexServer,
@@ -27,14 +28,78 @@ function parseVerbosity(argv: string[]): { verbose: number; unknown: string[] } 
 
 type PathMap = Record<string, string>;
 
+type ChangeEvent = "add" | "change" | "unlink";
+const KNOWN_EVENTS: ReadonlySet<string> = new Set<ChangeEvent>(["add", "change", "unlink"]);
+
+interface FileEvent {
+  event: ChangeEvent;
+  path: string;
+  timestamp: string;
+}
+
+interface MappedEvent extends FileEvent {
+  /** Plex container-side path equivalent of `path` (host → container rewritten). */
+  containerPath: string;
+  /** Parent directory of `containerPath`. */
+  parent: string;
+}
+
 const PATH_MAP_FILE = process.env["PLEX_PATH_MAP_FILE"]?.trim()
   ?? resolve(SCRIPT_DIRECTORY, "plex-path-map.json");
-const CHANGED_PATHS = process.env["CHANGED_PATHS"]?.trim();
+const CHANGED_EVENTS = process.env["CHANGED_EVENTS"]?.trim();
 
 function pathStartsWith(p: string, prefix: string): boolean {
   if (!p.startsWith(prefix)) return false;
   const next = p.charAt(prefix.length);
   return next === "" || next === "/";
+}
+
+function parseEvents(raw: string): FileEvent[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`CHANGED_EVENTS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("CHANGED_EVENTS must be a JSON array");
+  }
+  const out: FileEvent[] = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const entry = parsed[i];
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`CHANGED_EVENTS[${i}] is not an object`);
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e["event"] !== "string" || typeof e["path"] !== "string" || typeof e["timestamp"] !== "string") {
+      throw new Error(`CHANGED_EVENTS[${i}] is missing required string fields {event, path, timestamp}`);
+    }
+    if (!KNOWN_EVENTS.has(e["event"])) {
+      log(`Skipping CHANGED_EVENTS[${i}] — unknown event type "${e["event"]}"`);
+      continue;
+    }
+    out.push({
+      event: e["event"] as ChangeEvent,
+      path: e["path"],
+      timestamp: e["timestamp"],
+    });
+  }
+  return out;
+}
+
+function sectionsContaining(path: string, sections: Section[], trace: (msg: string) => void): Section[] {
+  const matches: Section[] = [];
+  for (const section of sections) {
+    for (const location of section.locations) {
+      const m = pathStartsWith(path, location.path);
+      trace(`  test "${path}" against section ${section.key} (${section.title}) location "${location.path}" = ${m}`);
+      if (m) {
+        matches.push(section);
+        break;
+      }
+    }
+  }
+  return matches;
 }
 
 async function main(): Promise<void> {
@@ -45,8 +110,20 @@ async function main(): Promise<void> {
   }
   const { debug, trace } = makeDebug(verbose, TAG);
 
-  if (!CHANGED_PATHS) {
-    log("No CHANGED_PATHS set, nothing to do");
+  if (!CHANGED_EVENTS) {
+    log("No CHANGED_EVENTS set, nothing to do");
+    return;
+  }
+
+  let events: FileEvent[];
+  try {
+    events = parseEvents(CHANGED_EVENTS);
+  } catch (err) {
+    logError(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+  if (events.length === 0) {
+    log("CHANGED_EVENTS contained no actionable events — nothing to do");
     return;
   }
 
@@ -59,36 +136,34 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const entries = Object.entries(pathMap);
-  debug(`Loaded ${entries.length} mapping(s) from ${PATH_MAP_FILE}`);
-  for (const [host, container] of entries) trace(`  map: ${host} -> ${container}`);
+  const mapEntries = Object.entries(pathMap);
+  debug(`Loaded ${mapEntries.length} mapping(s) from ${PATH_MAP_FILE}`);
+  for (const [host, container] of mapEntries) trace(`  map: ${host} -> ${container}`);
 
-  const changedPaths = CHANGED_PATHS.split("\n").map((p) => p.trim()).filter(Boolean);
-  log(`Processing ${changedPaths.length} changed path(s)`);
-
-  const mappedParentDirs = new Set<string>();
-  for (const hostPath of changedPaths) {
-    let mapped: string | null = null;
-    for (const [host, container] of entries) {
-      const matches = pathStartsWith(hostPath, host);
-      trace(`  test "${hostPath}" startsWith "${host}" = ${matches}`);
+  log(`Processing ${events.length} event(s)`);
+  const mapped: MappedEvent[] = [];
+  for (const ev of events) {
+    let containerPath: string | null = null;
+    for (const [host, container] of mapEntries) {
+      const matches = pathStartsWith(ev.path, host);
+      trace(`  test "${ev.path}" startsWith "${host}" = ${matches}`);
       if (matches) {
-        mapped = container + hostPath.slice(host.length);
-        trace(`  mapped via "${host}" -> "${container}" -> ${mapped}`);
+        containerPath = container + ev.path.slice(host.length);
+        trace(`  mapped via "${host}" -> "${container}" -> ${containerPath}`);
         break;
       }
     }
-    if (mapped === null) {
-      log(`  ${hostPath} — no host→container mapping, skipping`);
+    if (containerPath === null) {
+      log(`  [${ev.event}] ${ev.path} — no host→container mapping, skipping`);
       continue;
     }
-    const parent = dirname(mapped);
-    log(`  ${hostPath} -> ${mapped} (parent: ${parent})`);
-    mappedParentDirs.add(parent);
+    const parent = dirname(containerPath);
+    log(`  [${ev.event}] ${ev.path} -> ${containerPath} (parent: ${parent})`);
+    mapped.push({ ...ev, containerPath, parent });
   }
 
-  if (mappedParentDirs.size === 0) {
-    log("No paths matched any host→container mapping — nothing to refresh");
+  if (mapped.length === 0) {
+    log("No events matched any host→container mapping — nothing to do");
     return;
   }
 
@@ -98,11 +173,33 @@ async function main(): Promise<void> {
   const sections = await library.sections();
   debug(`Plex returned ${sections.length} section(s)`);
 
-  // Build a deduped list of (sectionId, parent) targets so each parent dir
-  // gets its own scoped scan rather than refreshing the whole section.
+  // Process unlinks first: try to API-delete the matching Plex item(s).
+  // Failures (or no match) are non-fatal — the parent scoped scan below
+  // will reconcile by marking items missing.
+  const unlinks = mapped.filter((e) => e.event === "unlink");
+  if (unlinks.length > 0) {
+    log(`Processing ${unlinks.length} unlink event(s) via Plex API delete`);
+    for (const ev of unlinks) {
+      const matching = sectionsContaining(ev.containerPath, sections, trace);
+      if (matching.length === 0) {
+        log(`  ${ev.containerPath} — no section owns this path, skipping delete`);
+        continue;
+      }
+      for (const section of matching) {
+        debug(`Attempting delete in section ${section.key} (${section.title}) for ${ev.containerPath}`);
+        const result = await deleteItemByPath({ section, containerPath: ev.containerPath, verbose });
+        log(`  section ${section.key}: found=${result.found} deleted=${result.deleted} (${ev.containerPath})`);
+      }
+    }
+  }
+
+  // Build deduped (sectionId, parentDir) targets from EVERY event's parent —
+  // add, change, and unlink alike. Unlink parents are included so Plex
+  // reconciles empty Albums/Shows/Seasons after the API delete.
   const seen = new Set<string>();
   const targets: TriggerTarget[] = [];
-  for (const parent of mappedParentDirs) {
+  const parentDirs = new Set(mapped.map((e) => e.parent));
+  for (const parent of parentDirs) {
     let matchedAny = false;
     for (const section of sections) {
       for (const location of section.locations) {
@@ -123,7 +220,7 @@ async function main(): Promise<void> {
   }
 
   if (targets.length === 0) {
-    log("No matching Plex sections found for changed paths");
+    log("No matching Plex sections found for event parents — no scans to trigger");
     return;
   }
 

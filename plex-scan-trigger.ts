@@ -7,7 +7,7 @@ import {
   logError as baseLogError,
   makeDebug,
 } from "./plex-client.ts";
-import type { Section } from "@ctrl/plex";
+import { SEARCHTYPES, type Section } from "@ctrl/plex";
 
 const TAG = "plex-scan-trigger";
 const log = (msg: string) => baseLog(TAG, msg);
@@ -225,6 +225,113 @@ export async function triggerScan(options: TriggerScanOptions = {}): Promise<voi
 
   await waitForCompletion([...startedIds], verbose);
   log("Scan trigger completed.");
+}
+
+export interface DeleteByPathOptions {
+  section: Section;
+  /** Plex container-side file path. Must match `Media.Part.file` exactly. */
+  containerPath: string;
+  verbose?: number;
+}
+
+export interface DeleteByPathResult {
+  /** Candidate items returned by Plex whose Part.file exactly matched containerPath. */
+  found: number;
+  /** Of `found`, how many DELETE calls returned 2xx. */
+  deleted: number;
+}
+
+const FILE_LIBTYPE_BY_SECTION_TYPE: Record<string, keyof typeof SEARCHTYPES> = {
+  movie: "movie",
+  show: "episode",
+  artist: "track",
+  photo: "photo",
+};
+
+interface RawMetadataPart {
+  file?: string;
+}
+interface RawMetadataMedia {
+  Part?: RawMetadataPart[];
+}
+interface RawMetadata {
+  ratingKey?: string | number;
+  title?: string;
+  Media?: RawMetadataMedia[];
+}
+
+/**
+ * Look up Plex items by exact file path within `section` and delete each match.
+ *
+ * Bypasses `@ctrl/plex`'s typed filter API (which rejects unknown filter keys
+ * like `file`) and queries `/library/sections/{id}/all?type=N&file=<path>`
+ * directly. Plex's `file` filter is a substring match, so each candidate is
+ * verified against `Media.Part.file === containerPath` before deletion.
+ *
+ * Requires "Allow media deletion" in the Plex server's library settings.
+ */
+export async function deleteItemByPath(opts: DeleteByPathOptions): Promise<DeleteByPathResult> {
+  const { section, containerPath, verbose = 0 } = opts;
+  const { debug, trace } = makeDebug(verbose, TAG);
+
+  const fileLibtype = FILE_LIBTYPE_BY_SECTION_TYPE[section.type];
+  if (!fileLibtype) {
+    trace(`section ${section.key} type="${section.type}" has no file-level items — skipping delete`);
+    return { found: 0, deleted: 0 };
+  }
+  const typeNum = SEARCHTYPES[fileLibtype];
+
+  const params = new URLSearchParams({
+    type: String(typeNum),
+    file: containerPath,
+    includeGuids: "0",
+  });
+  const lookupPath = `/library/sections/${section.key}/all?${params.toString()}`;
+  debug(`Looking up items by file path in section ${section.key} — GET ${lookupPath}`);
+
+  const server = section.server;
+  let response: { MediaContainer?: { Metadata?: RawMetadata[] } };
+  try {
+    response = await server.query({ path: lookupPath });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logError(`Lookup failed for "${containerPath}" in section ${section.key}: ${msg}`);
+    return { found: 0, deleted: 0 };
+  }
+
+  const candidates = response.MediaContainer?.Metadata ?? [];
+  trace(`section ${section.key} returned ${candidates.length} candidate(s) for "${containerPath}"`);
+
+  let found = 0;
+  let deleted = 0;
+  for (const elem of candidates) {
+    const partFiles: string[] = [];
+    for (const media of elem.Media ?? []) {
+      for (const part of media.Part ?? []) {
+        if (typeof part.file === "string") partFiles.push(part.file);
+      }
+    }
+    if (!partFiles.includes(containerPath)) {
+      trace(`  ratingKey=${elem.ratingKey} title="${elem.title}" — substring match only (parts: ${JSON.stringify(partFiles)}), skipping`);
+      continue;
+    }
+    found++;
+    const ratingKey = elem.ratingKey;
+    if (ratingKey === undefined || ratingKey === null) {
+      trace(`  candidate matched but has no ratingKey — skipping`);
+      continue;
+    }
+    debug(`Deleting ratingKey=${ratingKey} title="${elem.title ?? "?"}" file="${containerPath}"`);
+    try {
+      await server.query({ path: `/library/metadata/${ratingKey}`, method: "delete" });
+      console.log(`  ✓ Deleted ratingKey=${ratingKey} (${elem.title ?? "?"})`);
+      deleted++;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`  ✗ Failed to delete ratingKey=${ratingKey}: ${msg}`);
+    }
+  }
+  return { found, deleted };
 }
 
 async function waitForCompletion(startedIds: string[], verbose: number): Promise<void> {
