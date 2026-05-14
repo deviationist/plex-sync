@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import {
   getPlexServer,
   fetchActivitySnapshot,
+  configureFileLogging,
   log as baseLog,
   logError as baseLogError,
   makeDebug,
@@ -29,6 +30,9 @@ OPTIONS:
                      -vv or -v -v for step-by-step trace)
     --path PATH      Scope the scan to PATH (a Plex container-side path under
                      the section's root). Requires exactly one SECTION_ID.
+    --log-file PATH  Mirror all console output to PATH (relative to script dir).
+                     Overrides LOG_FILE env var.
+    --no-log         Disable file logging even if LOG_FILE env var is set.
 
 ARGUMENTS:
     SECTION_IDS      Optional comma-separated list of section IDs to trigger.
@@ -45,6 +49,7 @@ EXAMPLES:
 REQUIREMENTS:
     .env in the script directory with PLEX_HOST and PLEX_TOKEN.
     Optional POLL_INTERVAL (seconds, default 2) for --wait-finish polling.
+    Optional LOG_FILE / LOG_ENABLED / LOG_MAX_BYTES env vars for file logging.
 `;
 
 export interface TriggerTarget {
@@ -74,6 +79,8 @@ interface ParsedArgs {
   verbose: number;
   sectionIds: string[];
   path: string | null;
+  logFile: string | null;
+  noLog: boolean;
   errors: string[];
 }
 
@@ -84,6 +91,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     verbose: 0,
     sectionIds: [],
     path: null,
+    logFile: null,
+    noLog: false,
     errors: [],
   };
   const positional: string[] = [];
@@ -103,6 +112,18 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
     } else if (arg.startsWith("--path=")) {
       out.path = arg.slice("--path=".length);
+    } else if (arg === "--log-file") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("-")) {
+        out.errors.push("--log-file requires a path value");
+      } else {
+        out.logFile = value;
+        i++;
+      }
+    } else if (arg.startsWith("--log-file=")) {
+      out.logFile = arg.slice("--log-file=".length);
+    } else if (arg === "--no-log") {
+      out.noLog = true;
     } else if (arg.startsWith("-")) out.errors.push(`Unknown option: ${arg}`);
     else positional.push(arg);
   }
@@ -509,6 +530,8 @@ async function main(): Promise<void> {
     console.error("Run with --help for usage.");
     process.exit(2);
   }
+  if (args.logFile !== null) configureFileLogging({ filePath: args.logFile });
+  if (args.noLog) configureFileLogging({ enabled: false });
   const targets: TriggerTarget[] = args.sectionIds.map((id) => {
     const t: TriggerTarget = { sectionId: id };
     if (args.path !== null) t.path = args.path;

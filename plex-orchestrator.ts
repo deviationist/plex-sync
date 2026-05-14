@@ -10,6 +10,7 @@ import {
 } from "./plex-scan-trigger.ts";
 import {
   SCRIPT_DIRECTORY,
+  configureFileLogging,
   getPlexServer,
   log as baseLog,
   logError as baseLogError,
@@ -20,15 +21,37 @@ const TAG = "plex-orchestrator";
 const log = (msg: string) => baseLog(TAG, msg);
 const logError = (msg: string) => baseLogError(TAG, msg);
 
-function parseVerbosity(argv: string[]): { verbose: number; unknown: string[] } {
-  let verbose = 0;
-  const unknown: string[] = [];
-  for (const arg of argv) {
-    if (arg === "-v" || arg === "--verbose") verbose += 1;
-    else if (arg === "-vv") verbose += 2;
-    else unknown.push(arg);
+interface ParsedCliArgs {
+  verbose: number;
+  logFile: string | null;
+  noLog: boolean;
+  unknown: string[];
+  errors: string[];
+}
+
+function parseCliArgs(argv: string[]): ParsedCliArgs {
+  const out: ParsedCliArgs = { verbose: 0, logFile: null, noLog: false, unknown: [], errors: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "-v" || arg === "--verbose") out.verbose += 1;
+    else if (arg === "-vv") out.verbose += 2;
+    else if (arg === "--no-log") out.noLog = true;
+    else if (arg === "--log-file") {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith("-")) {
+        out.errors.push("--log-file requires a path value");
+      } else {
+        out.logFile = value;
+        i++;
+      }
+    } else if (arg.startsWith("--log-file=")) {
+      out.logFile = arg.slice("--log-file=".length);
+    } else {
+      out.unknown.push(arg);
+    }
   }
-  return { verbose: Math.min(2, verbose), unknown };
+  out.verbose = Math.min(2, out.verbose);
+  return out;
 }
 
 type PathMap = Record<string, string>;
@@ -122,11 +145,17 @@ function sectionsContaining(path: string, sections: Section[], trace: (msg: stri
 }
 
 async function main(): Promise<void> {
-  const { verbose, unknown } = parseVerbosity(process.argv.slice(2));
-  if (unknown.length > 0) {
-    logError(`Unknown argument(s): ${unknown.join(", ")} — only -v/-vv are accepted`);
+  const { verbose, logFile, noLog, unknown, errors } = parseCliArgs(process.argv.slice(2));
+  if (errors.length > 0) {
+    for (const e of errors) logError(e);
     process.exit(2);
   }
+  if (unknown.length > 0) {
+    logError(`Unknown argument(s): ${unknown.join(", ")} — accepted: -v/-vv, --log-file PATH, --no-log`);
+    process.exit(2);
+  }
+  if (logFile !== null) configureFileLogging({ filePath: logFile });
+  if (noLog) configureFileLogging({ enabled: false });
   const { debug, trace } = makeDebug(verbose, TAG);
 
   if (!CHANGED_EVENTS) {

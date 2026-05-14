@@ -88,6 +88,29 @@ The parent-dir scan after `change`/`unlink` is opt-in via two independent env va
 
 Accepted truthy values: `true`, `1`, `yes`, `on` (case-insensitive). Anything else (including unset) is treated as off.
 
+## Logging
+
+File logging is optional and off by default. When enabled it mirrors every `console.log` / `console.error` line (timestamped tagged logs *and* the raw `✓`/`✗` / progress lines) to the configured path, so the console stays unchanged.
+
+Knobs (all optional, in `.env` or passed at runtime):
+
+- `LOG_FILE=path` — enable file logging. Absolute paths used as-is; relative paths resolve against the script directory.
+- `LOG_ENABLED=true|false` — force on/off without unsetting `LOG_FILE`. Accepts `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`.
+- `LOG_MAX_BYTES=10485760` — rollover threshold. When the next write would exceed it, the current file is renamed to `<path>.1` (overwriting any prior `.1`) and a fresh file is started. Default 10 MB.
+
+CLI flags on both `plex-scan-trigger.ts` and `plex-orchestrator.ts` override the env vars for one-off runs:
+
+- `--log-file PATH` — same as `LOG_FILE`, takes precedence.
+- `--no-log` — force-disable for this run even if `LOG_FILE` is set.
+
+```bash
+npx tsx ./plex-scan-trigger.ts 25 --log-file /var/log/plex-sync.log
+LOG_FILE=plex-sync.log npx tsx ./plex-orchestrator.ts
+LOG_FILE=plex-sync.log npx tsx ./plex-scan-trigger.ts 25 --no-log   # path set but disabled
+```
+
+If a file write fails (permission, missing directory, etc.) the script logs a single error to stderr and disables further file writes for that run — the Plex work still completes.
+
 ## `plex-path-map.json` format
 
 ```json
