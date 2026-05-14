@@ -2,7 +2,12 @@ import { dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Section } from "@ctrl/plex";
-import { deleteItemByPath, triggerScan, type TriggerTarget } from "./plex-scan-trigger.ts";
+import {
+  deleteItemByPath,
+  refreshItemByPath,
+  triggerScan,
+  type TriggerTarget,
+} from "./plex-scan-trigger.ts";
 import {
   SCRIPT_DIRECTORY,
   getPlexServer,
@@ -47,6 +52,20 @@ interface MappedEvent extends FileEvent {
 const PATH_MAP_FILE = process.env["PLEX_PATH_MAP_FILE"]?.trim()
   ?? resolve(SCRIPT_DIRECTORY, "plex-path-map.json");
 const CHANGED_EVENTS = process.env["CHANGED_EVENTS"]?.trim();
+const SCOPED_SCAN_AFTER_CHANGE = parseBool(process.env["SCOPED_SCAN_AFTER_CHANGE"]);
+const SCOPED_SCAN_AFTER_UNLINK = parseBool(process.env["SCOPED_SCAN_AFTER_UNLINK"]);
+
+function parseBool(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function shouldScanParentFor(event: ChangeEvent): boolean {
+  if (event === "add") return true;
+  if (event === "change") return SCOPED_SCAN_AFTER_CHANGE;
+  return SCOPED_SCAN_AFTER_UNLINK;
+}
 
 function pathStartsWith(p: string, prefix: string): boolean {
   if (!p.startsWith(prefix)) return false;
@@ -193,12 +212,41 @@ async function main(): Promise<void> {
     }
   }
 
-  // Build deduped (sectionId, parentDir) targets from EVERY event's parent —
-  // add, change, and unlink alike. Unlink parents are included so Plex
-  // reconciles empty Albums/Shows/Seasons after the API delete.
+  // Process changes: force a per-file metadata refresh so in-place tag edits
+  // (e.g., OneTagger ID3 updates) are re-read by Plex. A normal section scan
+  // skips files whose size/mtime didn't change, so the parent scoped scan
+  // below would not pick these up on its own.
+  const changes = mapped.filter((e) => e.event === "change");
+  if (changes.length > 0) {
+    log(`Processing ${changes.length} change event(s) via Plex API metadata refresh`);
+    for (const ev of changes) {
+      const matching = sectionsContaining(ev.containerPath, sections, trace);
+      if (matching.length === 0) {
+        log(`  ${ev.containerPath} — no section owns this path, skipping refresh`);
+        continue;
+      }
+      for (const section of matching) {
+        debug(`Attempting metadata refresh in section ${section.key} (${section.title}) for ${ev.containerPath}`);
+        const result = await refreshItemByPath({ section, containerPath: ev.containerPath, verbose });
+        log(`  section ${section.key}: found=${result.found} refreshed=${result.refreshed} (${ev.containerPath})`);
+      }
+    }
+  }
+
+  // Build deduped (sectionId, parentDir) targets. `add` events always
+  // contribute their parent dir (no precise API call exists for them).
+  // `change` contributes only when SCOPED_SCAN_AFTER_CHANGE is on, and
+  // `unlink` only when SCOPED_SCAN_AFTER_UNLINK is on — in those cases
+  // the scan acts as a safety net for the precise API call (catching
+  // files Plex hasn't indexed yet on a refresh, or reconciling empty
+  // Albums/Shows/Seasons after a delete).
+  const eventsForScan = mapped.filter((e) => shouldScanParentFor(e.event));
+  if (eventsForScan.length < mapped.length) {
+    debug(`Skipping parent scan for ${mapped.length - eventsForScan.length} event(s) (SCOPED_SCAN_AFTER_CHANGE=${SCOPED_SCAN_AFTER_CHANGE}, SCOPED_SCAN_AFTER_UNLINK=${SCOPED_SCAN_AFTER_UNLINK})`);
+  }
   const seen = new Set<string>();
   const targets: TriggerTarget[] = [];
-  const parentDirs = new Set(mapped.map((e) => e.parent));
+  const parentDirs = new Set(eventsForScan.map((e) => e.parent));
   for (const parent of parentDirs) {
     let matchedAny = false;
     for (const section of sections) {
