@@ -260,24 +260,29 @@ interface RawMetadata {
   Media?: RawMetadataMedia[];
 }
 
+interface ItemMatch {
+  ratingKey: string;
+  title: string;
+}
+
 /**
- * Look up Plex items by exact file path within `section` and delete each match.
- *
  * Bypasses `@ctrl/plex`'s typed filter API (which rejects unknown filter keys
  * like `file`) and queries `/library/sections/{id}/all?type=N&file=<path>`
  * directly. Plex's `file` filter is a substring match, so each candidate is
- * verified against `Media.Part.file === containerPath` before deletion.
- *
- * Requires "Allow media deletion" in the Plex server's library settings.
+ * verified against `Media.Part.file === containerPath` before being returned.
  */
-export async function deleteItemByPath(opts: DeleteByPathOptions): Promise<DeleteByPathResult> {
-  const { section, containerPath, verbose = 0 } = opts;
+async function findItemsByExactPath(opts: {
+  section: Section;
+  containerPath: string;
+  verbose: number;
+}): Promise<ItemMatch[]> {
+  const { section, containerPath, verbose } = opts;
   const { debug, trace } = makeDebug(verbose, TAG);
 
   const fileLibtype = FILE_LIBTYPE_BY_SECTION_TYPE[section.type];
   if (!fileLibtype) {
-    trace(`section ${section.key} type="${section.type}" has no file-level items — skipping delete`);
-    return { found: 0, deleted: 0 };
+    trace(`section ${section.key} type="${section.type}" has no file-level items — skipping lookup`);
+    return [];
   }
   const typeNum = SEARCHTYPES[fileLibtype];
 
@@ -289,21 +294,19 @@ export async function deleteItemByPath(opts: DeleteByPathOptions): Promise<Delet
   const lookupPath = `/library/sections/${section.key}/all?${params.toString()}`;
   debug(`Looking up items by file path in section ${section.key} — GET ${lookupPath}`);
 
-  const server = section.server;
   let response: { MediaContainer?: { Metadata?: RawMetadata[] } };
   try {
-    response = await server.query({ path: lookupPath });
+    response = await section.server.query({ path: lookupPath });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logError(`Lookup failed for "${containerPath}" in section ${section.key}: ${msg}`);
-    return { found: 0, deleted: 0 };
+    return [];
   }
 
   const candidates = response.MediaContainer?.Metadata ?? [];
   trace(`section ${section.key} returned ${candidates.length} candidate(s) for "${containerPath}"`);
 
-  let found = 0;
-  let deleted = 0;
+  const matches: ItemMatch[] = [];
   for (const elem of candidates) {
     const partFiles: string[] = [];
     for (const media of elem.Media ?? []) {
@@ -315,23 +318,79 @@ export async function deleteItemByPath(opts: DeleteByPathOptions): Promise<Delet
       trace(`  ratingKey=${elem.ratingKey} title="${elem.title}" — substring match only (parts: ${JSON.stringify(partFiles)}), skipping`);
       continue;
     }
-    found++;
-    const ratingKey = elem.ratingKey;
-    if (ratingKey === undefined || ratingKey === null) {
+    if (elem.ratingKey === undefined || elem.ratingKey === null) {
       trace(`  candidate matched but has no ratingKey — skipping`);
       continue;
     }
-    debug(`Deleting ratingKey=${ratingKey} title="${elem.title ?? "?"}" file="${containerPath}"`);
+    matches.push({ ratingKey: String(elem.ratingKey), title: elem.title ?? "?" });
+  }
+  return matches;
+}
+
+/**
+ * Look up Plex items by exact file path within `section` and delete each match.
+ *
+ * Requires "Allow media deletion" in the Plex server's library settings.
+ */
+export async function deleteItemByPath(opts: DeleteByPathOptions): Promise<DeleteByPathResult> {
+  const { section, containerPath, verbose = 0 } = opts;
+  const { debug } = makeDebug(verbose, TAG);
+
+  const matches = await findItemsByExactPath({ section, containerPath, verbose });
+  let deleted = 0;
+  for (const match of matches) {
+    debug(`Deleting ratingKey=${match.ratingKey} title="${match.title}" file="${containerPath}"`);
     try {
-      await server.query({ path: `/library/metadata/${ratingKey}`, method: "delete" });
-      console.log(`  ✓ Deleted ratingKey=${ratingKey} (${elem.title ?? "?"})`);
+      await section.server.query({ path: `/library/metadata/${match.ratingKey}`, method: "delete" });
+      console.log(`  ✓ Deleted ratingKey=${match.ratingKey} (${match.title})`);
       deleted++;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.log(`  ✗ Failed to delete ratingKey=${ratingKey}: ${msg}`);
+      console.log(`  ✗ Failed to delete ratingKey=${match.ratingKey}: ${msg}`);
     }
   }
-  return { found, deleted };
+  return { found: matches.length, deleted };
+}
+
+export interface RefreshByPathOptions {
+  section: Section;
+  /** Plex container-side file path. Must match `Media.Part.file` exactly. */
+  containerPath: string;
+  verbose?: number;
+}
+
+export interface RefreshByPathResult {
+  /** Candidate items returned by Plex whose Part.file exactly matched containerPath. */
+  found: number;
+  /** Of `found`, how many PUT /refresh calls returned 2xx. */
+  refreshed: number;
+}
+
+/**
+ * Look up Plex items by exact file path within `section` and issue
+ * `PUT /library/metadata/{ratingKey}/refresh` for each match. Forces Plex
+ * to re-read tags/metadata from disk (a normal section scan skips files
+ * whose size and mtime suggest no change, so this is the only way to
+ * propagate in-place ID3/tag edits).
+ */
+export async function refreshItemByPath(opts: RefreshByPathOptions): Promise<RefreshByPathResult> {
+  const { section, containerPath, verbose = 0 } = opts;
+  const { debug } = makeDebug(verbose, TAG);
+
+  const matches = await findItemsByExactPath({ section, containerPath, verbose });
+  let refreshed = 0;
+  for (const match of matches) {
+    debug(`Refreshing metadata for ratingKey=${match.ratingKey} title="${match.title}" file="${containerPath}"`);
+    try {
+      await section.server.query({ path: `/library/metadata/${match.ratingKey}/refresh`, method: "put" });
+      console.log(`  ✓ Refreshed ratingKey=${match.ratingKey} (${match.title})`);
+      refreshed++;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`  ✗ Failed to refresh ratingKey=${match.ratingKey}: ${msg}`);
+    }
+  }
+  return { found: matches.length, refreshed };
 }
 
 async function waitForCompletion(startedIds: string[], verbose: number): Promise<void> {
