@@ -248,6 +248,7 @@ async function main(): Promise<void> {
   const changes = mapped.filter((e) => e.event === "change");
   if (changes.length > 0) {
     log(`Processing ${changes.length} change event(s) via Plex API metadata refresh`);
+    const alreadyRefreshed = new Set<string>();
     for (const ev of changes) {
       const matching = sectionsContaining(ev.containerPath, sections, trace);
       if (matching.length === 0) {
@@ -256,8 +257,8 @@ async function main(): Promise<void> {
       }
       for (const section of matching) {
         debug(`Attempting metadata refresh in section ${section.key} (${section.title}) for ${ev.containerPath}`);
-        const result = await refreshItemByPath({ section, containerPath: ev.containerPath, verbose });
-        log(`  section ${section.key}: found=${result.found} refreshed=${result.refreshed} (${ev.containerPath})`);
+        const result = await refreshItemByPath({ section, containerPath: ev.containerPath, verbose, alreadyRefreshed });
+        log(`  section ${section.key}: found=${result.found} refreshed=${result.refreshed} skipped=${result.skipped} (${ev.containerPath})`);
       }
     }
   }
@@ -272,6 +273,10 @@ async function main(): Promise<void> {
   const eventsForScan = mapped.filter((e) => shouldScanParentFor(e.event));
   if (eventsForScan.length < mapped.length) {
     debug(`Skipping parent scan for ${mapped.length - eventsForScan.length} event(s) (SCOPED_SCAN_AFTER_CHANGE=${SCOPED_SCAN_AFTER_CHANGE}, SCOPED_SCAN_AFTER_UNLINK=${SCOPED_SCAN_AFTER_UNLINK})`);
+  }
+  if (eventsForScan.length === 0) {
+    log(`All events handled via per-file API calls — no parent scans needed (SCOPED_SCAN_AFTER_CHANGE=${SCOPED_SCAN_AFTER_CHANGE}, SCOPED_SCAN_AFTER_UNLINK=${SCOPED_SCAN_AFTER_UNLINK})`);
+    return;
   }
   const seen = new Set<string>();
   const targets: TriggerTarget[] = [];

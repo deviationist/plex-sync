@@ -278,12 +278,21 @@ interface RawMetadataMedia {
 interface RawMetadata {
   ratingKey?: string | number;
   title?: string;
+  type?: string;
+  parentRatingKey?: string | number;
+  parentTitle?: string;
   Media?: RawMetadataMedia[];
 }
 
 interface ItemMatch {
   ratingKey: string;
   title: string;
+  /** Plex item type (e.g. "track", "movie", "episode"). */
+  type: string;
+  /** Parent ratingKey if present (e.g. album for a track). */
+  parentRatingKey: string | null;
+  /** Parent title if present (for human-readable logs). */
+  parentTitle: string | null;
 }
 
 /**
@@ -343,7 +352,15 @@ async function findItemsByExactPath(opts: {
       trace(`  candidate matched but has no ratingKey — skipping`);
       continue;
     }
-    matches.push({ ratingKey: String(elem.ratingKey), title: elem.title ?? "?" });
+    matches.push({
+      ratingKey: String(elem.ratingKey),
+      title: elem.title ?? "?",
+      type: elem.type ?? "",
+      parentRatingKey: elem.parentRatingKey !== undefined && elem.parentRatingKey !== null
+        ? String(elem.parentRatingKey)
+        : null,
+      parentTitle: elem.parentTitle ?? null,
+    });
   }
   return matches;
 }
@@ -378,6 +395,13 @@ export interface RefreshByPathOptions {
   /** Plex container-side file path. Must match `Media.Part.file` exactly. */
   containerPath: string;
   verbose?: number;
+  /**
+   * Shared set of ratingKeys already refreshed in this batch. The refresh
+   * target (e.g. parent album for music tracks) is looked up against this
+   * set; if present, the PUT is skipped. The set is mutated to record each
+   * ratingKey that gets refreshed.
+   */
+  alreadyRefreshed?: Set<string>;
 }
 
 export interface RefreshByPathResult {
@@ -385,33 +409,68 @@ export interface RefreshByPathResult {
   found: number;
   /** Of `found`, how many PUT /refresh calls returned 2xx. */
   refreshed: number;
+  /** Of `found`, how many were skipped because the refresh target was already refreshed in this batch. */
+  skipped: number;
+}
+
+/**
+ * Pick which ratingKey to refresh for a matched item.
+ *
+ * For music (`type === "track"`), refreshing the track itself does NOT
+ * re-read ID3 tags from disk — `/refresh` is for re-matching against the
+ * configured agent, not re-reading file content. Empirically the only path
+ * that propagates in-place tag edits is refreshing the parent album, which
+ * makes Plex walk the album's tracks. For everything else we refresh the
+ * item itself (movies have no useful parent; episodes are untested so we
+ * default to the item to avoid unintentionally refreshing whole seasons).
+ */
+function pickRefreshTarget(match: ItemMatch): { ratingKey: string; label: string } {
+  if (match.type === "track" && match.parentRatingKey !== null) {
+    return {
+      ratingKey: match.parentRatingKey,
+      label: `parent album ratingKey=${match.parentRatingKey} (${match.parentTitle ?? "?"}) for track ratingKey=${match.ratingKey} (${match.title})`,
+    };
+  }
+  return {
+    ratingKey: match.ratingKey,
+    label: `ratingKey=${match.ratingKey} (${match.title})`,
+  };
 }
 
 /**
  * Look up Plex items by exact file path within `section` and issue
- * `PUT /library/metadata/{ratingKey}/refresh` for each match. Forces Plex
- * to re-read tags/metadata from disk (a normal section scan skips files
- * whose size and mtime suggest no change, so this is the only way to
- * propagate in-place ID3/tag edits).
+ * `PUT /library/metadata/{ratingKey}/refresh` for the appropriate target.
+ * For music tracks the target is rewritten to the parent album, because
+ * track-level `/refresh` only re-matches the agent and does not re-read
+ * the file's ID3 tags (verified empirically). Pass a shared `alreadyRefreshed`
+ * Set to dedup album-level refreshes across multi-track batches.
  */
 export async function refreshItemByPath(opts: RefreshByPathOptions): Promise<RefreshByPathResult> {
-  const { section, containerPath, verbose = 0 } = opts;
+  const { section, containerPath, verbose = 0, alreadyRefreshed } = opts;
   const { debug } = makeDebug(verbose, TAG);
 
   const matches = await findItemsByExactPath({ section, containerPath, verbose });
   let refreshed = 0;
+  let skipped = 0;
   for (const match of matches) {
-    debug(`Refreshing metadata for ratingKey=${match.ratingKey} title="${match.title}" file="${containerPath}"`);
+    const target = pickRefreshTarget(match);
+    if (alreadyRefreshed?.has(target.ratingKey)) {
+      console.log(`  ↺ Skipped (already refreshed in this batch): ${target.label}`);
+      skipped++;
+      continue;
+    }
+    debug(`Refreshing metadata for ${target.label} file="${containerPath}"`);
     try {
-      await section.server.query({ path: `/library/metadata/${match.ratingKey}/refresh`, method: "put" });
-      console.log(`  ✓ Refreshed ratingKey=${match.ratingKey} (${match.title})`);
+      await section.server.query({ path: `/library/metadata/${target.ratingKey}/refresh`, method: "put" });
+      console.log(`  ✓ Refreshed ${target.label}`);
+      alreadyRefreshed?.add(target.ratingKey);
       refreshed++;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.log(`  ✗ Failed to refresh ratingKey=${match.ratingKey}: ${msg}`);
+      console.log(`  ✗ Failed to refresh ${target.label}: ${msg}`);
     }
   }
-  return { found: matches.length, refreshed };
+  return { found: matches.length, refreshed, skipped };
 }
 
 async function waitForCompletion(startedIds: string[], verbose: number): Promise<void> {
