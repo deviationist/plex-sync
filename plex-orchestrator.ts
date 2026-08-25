@@ -245,6 +245,21 @@ async function main(): Promise<void> {
   // (e.g., OneTagger ID3 updates) are re-read by Plex. A normal section scan
   // skips files whose size/mtime didn't change, so the parent scoped scan
   // below would not pick these up on its own.
+  //
+  // Measured 2026-08-25, on one edited MP3: a scoped scan of the folder did
+  // not re-read it (twice, over four minutes), nor did a refresh of the track
+  // itself; only the parent-album refresh below did, within ~20s. So this
+  // branch is not a safety net, it is the *only* thing that makes an edit
+  // reach Plex.
+  //
+  // Which makes it worth saying what it depends on: the watcher emitting
+  // `change` at all. Between 2026-08-24 and 2026-08-25 it did not -- the
+  // inotify source reads CLOSE_WRITE, which cannot tell a new file from a
+  // rewritten one, so every edit arrived as `add`, this branch never ran, and
+  // tag edits stopped reaching Plex without anything reporting a failure. The
+  // watcher now tracks CREATE to restore the distinction. If edits ever go
+  // quiet again, check that `change` is still being published before looking
+  // here.
   const changes = mapped.filter((e) => e.event === "change");
   if (changes.length > 0) {
     log(`Processing ${changes.length} change event(s) via Plex API metadata refresh`);
